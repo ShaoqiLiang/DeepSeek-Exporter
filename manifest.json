@@ -3,6 +3,19 @@
   "name": "DeepSeek Chat Exporter",
   "version": "1.0.0",
   "description": "一键导出 DeepSeek 对话中的多轮问答记录",
+  "icons": {
+    "16": "icons/exporter16.png",
+    "48": "icons/exporter48.png",
+    "128": "icons/exporter128.png"
+  },
+  "action": {
+    "default_popup": "dist/popup/popup.html",
+    "default_icon": {
+      "16": "icons/exporter16.png",
+      "48": "icons/exporter48.png",
+      "128": "icons/exporter128.png"
+    }
+  },
   "permissions": [
     "activeTab",
     "scripting",
@@ -24,8 +37,5 @@
       "css": ["dist/content/style.css"],
       "run_at": "document_idle"
     }
-  ],
-  "action": {
-    "default_popup": "dist/popup/popup.html"
-  }
+  ]
 }
