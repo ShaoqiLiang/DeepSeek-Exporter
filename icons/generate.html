@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<body>
+<canvas id="c"></canvas>
+<script>
+// 在浏览器中打开此页面，右键保存 canvas 为 PNG 图标
+[16, 48, 128].forEach(size => {
+  const c = document.getElementById('c')
+  c.width = c.height = size
+  const ctx = c.getContext('2d')
+  // 紫色渐变圆形
+  const grad = ctx.createLinearGradient(0, 0, size, size)
+  grad.addColorStop(0, '#667eea')
+  grad.addColorStop(1, '#764ba2')
+  ctx.fillStyle = grad
+  ctx.beginPath()
+  ctx.arc(size/2, size/2, size/2, 0, Math.PI*2)
+  ctx.fill()
+  // 下载箭头
+  ctx.strokeStyle = 'white'
+  ctx.lineWidth = size * 0.08
+  ctx.lineCap = 'round'
+  ctx.beginPath()
+  ctx.moveTo(size*0.5, size*0.25)
+  ctx.lineTo(size*0.5, size*0.6)
+  ctx.stroke()
+  ctx.beginPath()
+  ctx.moveTo(size*0.35, size*0.5)
+  ctx.lineTo(size*0.5, size*0.65)
+  ctx.lineTo(size*0.65, size*0.5)
+  ctx.stroke()
+  // 下载到文件
+  const a = document.createElement('a')
+  a.download = `icon${size}.png`
+  a.href = c.toDataURL()
+  a.click()
+})
+</script>
+<p>如果下载没有自动开始，请右键上方的 canvas → 另存为图片</p>
+</body>
+</html>
