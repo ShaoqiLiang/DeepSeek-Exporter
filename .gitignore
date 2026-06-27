@@ -3,9 +3,13 @@ node_modules/
 
 # Build output
 dist/
+build/
 
 # Debug/Diagnosis scripts
 case/
+
+# Documentation
+doc/
 
 # IDE
 .vscode/
@@ -23,3 +27,7 @@ npm-debug.log*
 .env
 .env.local
 .env.*.local
+
+# CRX packaging
+*.crx
+key.pem
