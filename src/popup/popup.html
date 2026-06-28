@@ -93,7 +93,13 @@
       width: 16px;
       height: 16px;
     }
-    .option-row svg { flex-shrink: 0; }
+    .option-row svg {
+      flex-shrink: 0;
+      transition: fill 0.15s;
+    }
+    .option-row input:not(:checked) ~ svg {
+      fill: #999;
+    }
 
     /* 导出按钮 */
     .export-buttons {

@@ -74,6 +74,10 @@
 }
 .ds-export-option svg {
   flex-shrink: 0;
+  transition: fill 0.15s;
+}
+.ds-export-option input:not(:checked) ~ svg {
+  fill: #999;
 }
 
 .ds-export-option input[type="checkbox"] {
