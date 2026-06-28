@@ -13,6 +13,28 @@ const btnHtml = document.getElementById('btn-html')!
 const optThinking = document.getElementById('opt-thinking') as HTMLInputElement
 const optSearch = document.getElementById('opt-search') as HTMLInputElement
 
+// ==================== 设置同步 ====================
+
+// 从 storage 加载设置
+chrome.storage.sync.get(['includeThinking', 'includeSearch'], (result) => {
+  optThinking.checked = result.includeThinking ?? false
+  optSearch.checked = result.includeSearch ?? false
+})
+
+// 监听变化并保存到 storage
+optThinking.addEventListener('change', () => {
+  chrome.storage.sync.set({ includeThinking: optThinking.checked })
+})
+optSearch.addEventListener('change', () => {
+  chrome.storage.sync.set({ includeSearch: optSearch.checked })
+})
+
+// 监听 storage 变化（来自 content script 的同步）
+chrome.storage.onChanged.addListener((changes) => {
+  if (changes.includeThinking) optThinking.checked = changes.includeThinking.newValue
+  if (changes.includeSearch) optSearch.checked = changes.includeSearch.newValue
+})
+
 // ==================== 加载对话列表 ====================
 
 async function loadConversations() {

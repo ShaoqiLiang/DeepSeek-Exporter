@@ -310,7 +310,10 @@ function injectUI() {
     <div class="ds-export-menu" style="display:none">
       <div class="ds-export-options">
         <label class="ds-export-option">
-          <input type="checkbox" id="ds-opt-thinking" checked> 包含思考过程
+          <input type="checkbox" id="ds-opt-thinking"> 包含思考过程
+        </label>
+        <label class="ds-export-option">
+          <input type="checkbox" id="ds-opt-search"> 包含搜索结果
         </label>
       </div>
       <div class="ds-export-formats">
@@ -334,6 +337,28 @@ function injectUI() {
 
   const trigger = wrapper.querySelector('.ds-export-trigger')!
   const menu = wrapper.querySelector('.ds-export-menu') as HTMLElement
+  const optThinking = wrapper.querySelector('#ds-opt-thinking') as HTMLInputElement
+  const optSearch = wrapper.querySelector('#ds-opt-search') as HTMLInputElement
+
+  // 从 storage 加载设置
+  chrome.storage.sync.get(['includeThinking', 'includeSearch'], (result) => {
+    optThinking.checked = result.includeThinking ?? false
+    optSearch.checked = result.includeSearch ?? false
+  })
+
+  // 监听变化并保存到 storage
+  optThinking.addEventListener('change', () => {
+    chrome.storage.sync.set({ includeThinking: optThinking.checked })
+  })
+  optSearch.addEventListener('change', () => {
+    chrome.storage.sync.set({ includeSearch: optSearch.checked })
+  })
+
+  // 监听 storage 变化（来自 popup 的同步）
+  chrome.storage.onChanged.addListener((changes) => {
+    if (changes.includeThinking) optThinking.checked = changes.includeThinking.newValue
+    if (changes.includeSearch) optSearch.checked = changes.includeSearch.newValue
+  })
 
   trigger.addEventListener('click', (e) => {
     e.stopPropagation()
@@ -348,8 +373,7 @@ function injectUI() {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation()
       const format = (e.currentTarget as HTMLElement).dataset.format as string
-      const includeThinking = (document.querySelector('#ds-opt-thinking') as HTMLInputElement)?.checked ?? true
-      await doExport(format, includeThinking)
+      await doExport(format, optThinking.checked)
     })
   })
 }
