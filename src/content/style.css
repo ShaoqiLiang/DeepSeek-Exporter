@@ -72,6 +72,9 @@
   color: #555;
   cursor: pointer;
 }
+.ds-export-option svg {
+  flex-shrink: 0;
+}
 
 .ds-export-option input[type="checkbox"] {
   accent-color: #667eea;
