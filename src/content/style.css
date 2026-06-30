@@ -172,6 +172,31 @@
   color: #e65100;
 }
 
+/* 状态容器和取消按钮 */
+.ds-export-status-container {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ds-export-cancel-btn {
+  width: 100%;
+  padding: 6px 12px;
+  background: #fff;
+  border: 1px solid #f44336;
+  border-radius: 6px;
+  color: #f44336;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.ds-export-cancel-btn:hover {
+  background: #f44336;
+  color: #fff;
+}
+
 /* 诊断按钮 */
 .ds-export-diag {
   margin-top: 8px;
@@ -219,5 +244,16 @@
 
   .ds-export-options {
     border-bottom-color: #444;
+  }
+
+  .ds-export-cancel-btn {
+    background: #2d2d2d;
+    border-color: #f44336;
+    color: #f44336;
+  }
+
+  .ds-export-cancel-btn:hover {
+    background: #f44336;
+    color: #fff;
   }
 }

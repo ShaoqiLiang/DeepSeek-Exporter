@@ -3,10 +3,18 @@
 
 console.log('[DS Exporter] Fiber Reader 方案启动')
 
+interface SearchReference {
+  index: number
+  url: string
+  title?: string
+}
+
 interface ParsedMessage {
   role: 'user' | 'assistant'
   content: string
   thinking?: string
+  searchSummary?: string
+  searchReferences?: SearchReference[]
 }
 
 // ==================== 从 React fiber 读取内容 ====================
@@ -15,122 +23,547 @@ interface ParsedMessage {
  * 从一个 DOM 元素的 React fiber 中提取 content 字段。
  * DeepSeek 的 AI 消息组件在 fiber.memoizedProps.content 中存有完整 Markdown。
  */
-function readContentFromFiber(el: Element): string | null {
-  const fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'))
-  if (!fiberKey) return null
+// ==================== Markdown AST 转换 ====================
 
-  let fiber = (el as any)[fiberKey]
-  let depth = 0
+interface MarkdownNode {
+  type: string
+  value?: string
+  children?: MarkdownNode[]
+  depth?: number
+  ordered?: boolean
+  start?: number | null
+  spread?: boolean
+  checked?: boolean | null
+  lang?: string
+  position?: any
+}
 
-  while (fiber && depth < 15) {
-    const props = fiber.memoizedProps
-    if (props && typeof props === 'object') {
-      // AI 消息组件的 props.content 是完整 Markdown
-      if (typeof props.content === 'string' && props.content.length > 20) {
-        return props.content
-      }
-      // 有些组件把内容放在 children 或 item 中
-      if (typeof props.children === 'string' && props.children.length > 20) {
-        return props.children
-      }
-      if (props.item?.content && typeof props.item.content === 'string') {
-        return props.item.content
-      }
-    }
+function astToMarkdown(node: MarkdownNode): string {
+  if (!node) return ''
 
-    // 也检查 memoizedState
-    const state = fiber.memoizedState
-    if (state && typeof state === 'object') {
-      let s = state
-      let sIdx = 0
-      while (s && sIdx < 5) {
-        const val = s.memoizedState
-        if (Array.isArray(val) && val.length > 0 && val[0]?.content) {
-          // 找到消息数组，返回完整数组的 JSON
-          return JSON.stringify(val)
+  switch (node.type) {
+    case 'root':
+      return (node.children || []).map(child => astToMarkdown(child)).join('\n\n')
+
+    case 'paragraph':
+      return (node.children || []).map(child => astToMarkdown(child)).join('')
+
+    case 'heading':
+      const prefix = '#'.repeat(node.depth || 1)
+      const content = (node.children || []).map(child => astToMarkdown(child)).join('')
+      return `${prefix} ${content}`
+
+    case 'text':
+      return node.value || ''
+
+    case 'strong':
+      const strongContent = (node.children || []).map(child => astToMarkdown(child)).join('')
+      return `**${strongContent}**`
+
+    case 'emphasis':
+      const emContent = (node.children || []).map(child => astToMarkdown(child)).join('')
+      return `*${emContent}*`
+
+    case 'inlineCode':
+      return `\`${node.value || ''}\``
+
+    case 'code':
+      const lang = node.lang || ''
+      return `\`\`\`${lang}\n${node.value || ''}\n\`\`\``
+
+    case 'blockquote':
+      const quoteContent = (node.children || []).map(child => astToMarkdown(child)).join('\n')
+      return quoteContent.split('\n').map(line => `> ${line}`).join('\n')
+
+    case 'list':
+      const items = (node.children || []).map((item, index) => {
+        const itemContent = astToMarkdown(item)
+        if (node.ordered) {
+          return `${(node.start || 1) + index}. ${itemContent}`
+        } else {
+          return `- ${itemContent}`
         }
-        s = s.next
-        sIdx++
+      })
+      return items.join('\n')
+
+    case 'listItem':
+      const itemChildren = (node.children || []).map(child => astToMarkdown(child))
+      return itemChildren.join('\n  ')
+
+    case 'link':
+      const linkText = (node.children || []).map(child => astToMarkdown(child)).join('')
+      const url = (node as any).url || ''
+      return `[${linkText}](${url})`
+
+    case 'image':
+      const alt = (node as any).alt || ''
+      const src = (node as any).url || ''
+      return `![${alt}](${src})`
+
+    case 'thematicBreak':
+      return '---'
+
+    case 'break':
+      return '\n'
+
+    case 'delete':
+      const delContent = (node.children || []).map(child => astToMarkdown(child)).join('')
+      return `~~${delContent}~~`
+
+    default:
+      // 对于未知类型，尝试处理子节点
+      if (node.children) {
+        return node.children.map(child => astToMarkdown(child)).join('')
+      }
+      return node.value || ''
+  }
+}
+
+// 注入脚本到页面主世界，提取消息（用户+助手）
+function injectScriptToGetMessages(): Promise<Array<{role: 'user' | 'assistant', content: string}>> {
+  return new Promise((resolve) => {
+    const handler = (event: MessageEvent) => {
+      if (event.data?.type === 'DS_EXPORTER_MESSAGES_RESULT') {
+        window.removeEventListener('message', handler)
+        resolve(event.data.messages || [])
+      }
+    }
+    window.addEventListener('message', handler)
+
+    const script = document.createElement('script')
+    script.textContent = `
+      (function() {
+        try {
+          const messages = [];
+
+          // 查找所有消息容器（虚拟列表的可见项）
+          const virtualItems = document.querySelector('.ds-virtual-list-visible-items') ||
+                               document.querySelector('[class*="virtual-list"]');
+          const chatContainer = virtualItems || document.querySelector('[class*="chat-list"]') ||
+                               document.querySelector('[class*="message-list"]');
+
+          if (!chatContainer) {
+            // 回退：直接查找所有消息元素
+            extractFromDirectDOM();
+          } else {
+            // 从容器中提取消息
+            extractFromContainer(chatContainer);
+          }
+
+          // 如果上面没找到，尝试直接查找 DOM 元素
+          if (messages.length === 0) {
+            extractFromDirectDOM();
+          }
+
+          function extractFromContainer(container) {
+            Array.from(container.children).forEach(child => {
+              // 跳过太小的元素
+              if (child.offsetHeight < 20) return;
+
+              // 判断角色：检查是否包含 assistant 消息元素
+              const assistantEl = child.querySelector('.ds-assistant-message-main-content');
+
+              if (assistantEl) {
+                // 助手消息：从 React fiber 提取 Markdown AST
+                const content = extractAssistantMarkdown(assistantEl);
+                if (content) {
+                  messages.push({ role: 'assistant', content: content });
+                }
+              } else {
+                // 用户消息：提取文本内容
+                // 查找用户消息的文本区域
+                const userTextEl = child.querySelector('[class*="user-message"]') ||
+                                   child.querySelector('[class*="ds-markdown"]') ||
+                                   child;
+                const text = (userTextEl.textContent || '').trim();
+                if (text.length > 0) {
+                  messages.push({ role: 'user', content: text });
+                }
+              }
+            });
+          }
+
+          function extractFromDirectDOM() {
+            // 查找助手消息
+            document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
+              const content = extractAssistantMarkdown(el);
+              if (content) {
+                messages.push({ role: 'assistant', content: content });
+              }
+            });
+
+            // 查找用户消息（通过排除助手消息的方式）
+            document.querySelectorAll('.ds-message, [class*="message"]').forEach(el => {
+              const hasAssistant = el.querySelector('.ds-assistant-message-main-content');
+              if (hasAssistant) return;
+              const text = (el.textContent || '').trim();
+              if (text.length > 0 && text.length < 5000) {
+                messages.push({ role: 'user', content: text });
+              }
+            });
+          }
+
+          function extractAssistantMarkdown(el) {
+            let fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+            if (!fiberKey) {
+              const child = el.querySelector('[class*="ds-markdown"]') || el.firstElementChild;
+              if (child) {
+                const childFiberKey = Object.keys(child).find(k => k.startsWith('__reactFiber$'));
+                if (childFiberKey) {
+                  el = child;
+                  fiberKey = childFiberKey;
+                }
+              }
+            }
+
+            if (!fiberKey) return null;
+
+            let fiber = el[fiberKey];
+            let depth = 0;
+            const astNodes = [];
+
+            while (fiber && depth < 30) {
+              const props = fiber.memoizedProps;
+              if (props && typeof props === 'object') {
+                if (props.node && typeof props.node === 'object' && props.node.type) {
+                  const blockTypes = ['paragraph', 'heading', 'list', 'blockquote', 'code', 'thematicBreak'];
+                  if (blockTypes.includes(props.node.type)) {
+                    astNodes.push(props.node);
+                  }
+                }
+              }
+              fiber = fiber.return;
+              depth++;
+            }
+
+            if (astNodes.length > 0) {
+              return astNodes.map(node => astToMarkdown(node)).join('\\n\\n');
+            }
+            return null;
+          }
+
+          // AST 转换函数
+          function astToMarkdown(node) {
+            if (!node) return '';
+
+            switch (node.type) {
+              case 'root':
+                return (node.children || []).map(child => astToMarkdown(child)).join('\\n\\n');
+
+              case 'paragraph':
+                return (node.children || []).map(child => astToMarkdown(child)).join('');
+
+              case 'heading':
+                const prefix = '#'.repeat(node.depth || 1);
+                const content = (node.children || []).map(child => astToMarkdown(child)).join('');
+                return prefix + ' ' + content;
+
+              case 'text':
+                return node.value || '';
+
+              case 'strong':
+                const strongContent = (node.children || []).map(child => astToMarkdown(child)).join('');
+                return '**' + strongContent + '**';
+
+              case 'emphasis':
+                const emContent = (node.children || []).map(child => astToMarkdown(child)).join('');
+                return '*' + emContent + '*';
+
+              case 'inlineCode':
+                return '\`' + (node.value || '') + '\`';
+
+              case 'code':
+                const lang = node.lang || '';
+                return '\`\`\`' + lang + '\\n' + (node.value || '') + '\\n\`\`\`';
+
+              case 'blockquote':
+                const quoteContent = (node.children || []).map(child => astToMarkdown(child)).join('\\n');
+                return quoteContent.split('\\n').map(line => '> ' + line).join('\\n');
+
+              case 'list':
+                const items = (node.children || []).map((item, index) => {
+                  const itemContent = astToMarkdown(item);
+                  if (node.ordered) {
+                    return (node.start || 1) + index + '. ' + itemContent;
+                  } else {
+                    return '- ' + itemContent;
+                  }
+                });
+                return items.join('\\n');
+
+              case 'listItem':
+                const itemChildren = (node.children || []).map(child => astToMarkdown(child));
+                return itemChildren.join('\\n  ');
+
+              case 'link':
+                const linkText = (node.children || []).map(child => astToMarkdown(child)).join('');
+                const url = node.url || '';
+                return '[' + linkText + '](' + url + ')';
+
+              case 'image':
+                const alt = node.alt || '';
+                const src = node.url || '';
+                return '![' + alt + '](' + src + ')';
+
+              case 'thematicBreak':
+                return '---';
+
+              case 'break':
+                return '\\n';
+
+              case 'delete':
+                const delContent = (node.children || []).map(child => astToMarkdown(child)).join('');
+                return '~~' + delContent + '~~';
+
+              default:
+                if (node.children) {
+                  return node.children.map(child => astToMarkdown(child)).join('');
+                }
+                return node.value || '';
+            }
+          }
+
+          // 发送结果给 content script
+          window.postMessage({
+            type: 'DS_EXPORTER_MESSAGES_RESULT',
+            messages: messages
+          }, '*');
+        } catch (e) {
+          console.error('[DS Exporter] 注入脚本执行失败:', e);
+          window.postMessage({
+            type: 'DS_EXPORTER_MESSAGES_RESULT',
+            messages: []
+          }, '*');
+        }
+      })();
+    `;
+    document.head.appendChild(script);
+    script.remove();
+
+    // 超时处理
+    setTimeout(() => {
+      window.removeEventListener('message', handler)
+      resolve([])
+    }, 3000)
+  })
+}
+
+// ==================== 捕获搜索结果 ====================
+
+function captureSearchResults(): { summary: string | null, references: SearchReference[], isExpanded: boolean } {
+  let summary: string | null = null
+  const references: SearchReference[] = []
+  const seenUrls = new Set<string>()
+  let isExpanded = false
+
+  // 1. 提取搜索摘要 - 尝试多个选择器
+  const summarySelectors = ['._769d943', '[class*="search"]', '[class*="Search"]']
+  for (const sel of summarySelectors) {
+    const el = document.querySelector(sel)
+    if (el && el.textContent?.includes('个网页')) {
+      summary = el.textContent.trim()
+      break
+    }
+  }
+
+  // 如果没找到，尝试从文本中提取
+  if (!summary) {
+    const allText = document.body.textContent || ''
+    const match = allText.match(/已阅读\s*\d+\s*个网页/)
+    if (match) {
+      summary = match[0]
+    }
+  }
+
+  // 2. 检查搜索结果是否展开
+  // 查找搜索结果容器，检查是否有展开状态
+  const searchContainer = document.querySelector('._60aa7fb, ._74c0879')
+  if (searchContainer) {
+    // 检查是否有展开的详细内容区域
+    const detailArea = searchContainer.querySelector('[class*="detail"], [class*="content"], [class*="body"]')
+    if (detailArea) {
+      // 检查是否有可见的链接列表
+      const links = detailArea.querySelectorAll('a[href]')
+      isExpanded = links.length > 0
+    }
+
+    // 如果没有找到详细内容区域，检查搜索容器本身是否有展开状态
+    if (!isExpanded) {
+      // 检查是否有展开按钮或状态
+      const expandButton = searchContainer.querySelector('[class*="expand"], [class*="toggle"], [class*="show"]')
+      if (expandButton) {
+        // 检查按钮状态
+        const isExpandedState = expandButton.getAttribute('aria-expanded') === 'true' ||
+                               expandButton.classList.contains('expanded') ||
+                               expandButton.classList.contains('active')
+        isExpanded = isExpandedState
       }
     }
 
-    fiber = fiber.return
-    depth++
+    // 如果还是没有确定，检查是否有可见的链接列表
+    if (!isExpanded) {
+      const allLinks = searchContainer.querySelectorAll('a[href^="http"]:not([href*="deepseek.com"])')
+      isExpanded = allLinks.length > 0
+    }
   }
-  return null
+
+  // 3. 提取引用链接 - 改进匹配逻辑
+  document.querySelectorAll('a[href]').forEach(a => {
+    const href = (a as HTMLAnchorElement).href
+    if (href && href.startsWith('http') && !href.includes('deepseek.com') && !seenUrls.has(href)) {
+      seenUrls.add(href)
+      const text = a.textContent?.trim() || ''
+      // 提取引用编号（如 "-1"、"-2"、"1"、"2" 等）
+      const match = text.match(/^[-]?(\d+)$/)
+      if (match) {
+        references.push({
+          index: parseInt(match[1]),
+          url: href
+        })
+      }
+    }
+  })
+
+  // 按编号排序
+  references.sort((a, b) => a.index - b.index)
+
+  console.log('[DS Exporter] 搜索结果:', { summary, referencesCount: references.length, isExpanded })
+  return { summary, references, isExpanded }
 }
 
 // ==================== 读取当前可见的消息 ====================
 
-function readVisibleMessages(): ParsedMessage[] {
+// 全局变量存储从页面提取消息的结果
+let pageMessages: Array<{role: 'user' | 'assistant', content: string}> = []
+
+// 从页面获取消息（用户+助手）
+async function fetchMessagesFromPage(): Promise<void> {
+  try {
+    console.log('[DS Exporter] 尝试从页面获取消息...')
+    const messages = await injectScriptToGetMessages()
+
+    if (messages.length > 0) {
+      console.log('[DS Exporter] 成功获取', messages.length, '条消息')
+      // 合并新消息（去重）
+      const existingKeys = new Set(pageMessages.map(m => m.content.slice(0, 100)))
+      for (const msg of messages) {
+        const key = msg.content.slice(0, 100)
+        if (!existingKeys.has(key)) {
+          pageMessages.push(msg)
+          existingKeys.add(key)
+        }
+      }
+    } else {
+      console.log('[DS Exporter] 未能获取消息，将使用 DOM 提取')
+    }
+  } catch (e) {
+    console.log('[DS Exporter] 从页面获取消息失败:', e)
+  }
+}
+
+function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
   const messages: ParsedMessage[] = []
   const seen = new Set<string>()
 
-  // AI 消息：有明确的 class 标识
-  document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
-    const content = readContentFromFiber(el)
-    if (content && !seen.has(content.slice(0, 100))) {
-      seen.add(content.slice(0, 100))
-      messages.push({ role: 'assistant', content })
+  // 捕获搜索结果（仅当 includeSearch 为 true 时）
+  let searchSummary: string | null = null
+  let searchReferences: SearchReference[] = []
+  if (includeSearch) {
+    const result = captureSearchResults()
+    searchSummary = result.summary
+    searchReferences = result.references
+  }
+
+  // 优先使用从注入脚本获取的结构化消息
+  if (pageMessages.length > 0) {
+    for (const msg of pageMessages) {
+      const key = msg.content.slice(0, 100)
+      if (!seen.has(key)) {
+        seen.add(key)
+        messages.push({ role: msg.role, content: msg.content })
+      }
     }
-  })
+    console.log('[DS Exporter] 使用页面消息:', messages.length, '条')
+  }
 
-  // 用户消息：通过兄弟关系或父容器推断
-  // 找所有 ds-message 容器，检查其内部是否有 assistant 标识
-  document.querySelectorAll('.ds-message').forEach(el => {
-    const hasAssistant = el.querySelector('.ds-assistant-message-main-content')
-    if (hasAssistant) return // 已经处理过
-
-    // 没有 assistant 标识 → 可能是用户消息
-    const content = readContentFromFiber(el)
-    if (content && !seen.has(content.slice(0, 100))) {
-      seen.add(content.slice(0, 100))
-      messages.push({ role: 'user', content })
-    }
-  })
-
-  // 兜底：找虚拟列表中的直接子元素（交替出现的用户/AI 消息）
-  const virtualItems = document.querySelector('.ds-virtual-list-visible-items')
-  if (virtualItems && messages.length === 0) {
-    Array.from(virtualItems.children).forEach(child => {
-      const text = child.textContent?.trim() || ''
-      if (text.length < 10) return
-
-      // 判断角色
-      const cls = (typeof child.className === 'string' ? child.className : '').toLowerCase()
-      const hasAssistant = child.querySelector('.ds-assistant-message-main-content')
-      const role: 'user' | 'assistant' = hasAssistant ? 'assistant' :
-        (cls.includes('user') || cls.includes('human') ? 'user' : guessRole(text))
-
-      // 尝试从 fiber 读取完整内容，回退到 textContent
-      const fiberContent = readContentFromFiber(child)
-      const content = fiberContent || text
-
-      if (!seen.has(content.slice(0, 100))) {
-        seen.add(content.slice(0, 100))
-        messages.push({ role, content })
+  // 如果页面消息为空，回退到 DOM 提取
+  if (messages.length === 0) {
+    // 查找助手消息
+    document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
+      const text = el.textContent?.trim() || ''
+      if (text && !seen.has(text.slice(0, 100))) {
+        seen.add(text.slice(0, 100))
+        messages.push({ role: 'assistant', content: text })
       }
     })
+
+    // 查找用户消息
+    document.querySelectorAll('.ds-message, [class*="message"]').forEach(el => {
+      const hasAssistant = el.querySelector('.ds-assistant-message-main-content')
+      if (hasAssistant) return
+      const text = el.textContent?.trim() || ''
+      if (text.length > 0 && !seen.has(text.slice(0, 100))) {
+        seen.add(text.slice(0, 100))
+        messages.push({ role: 'user', content: text })
+      }
+    })
+
+    // 最后回退：从虚拟列表中获取
+    if (messages.length === 0) {
+      const virtualItems = document.querySelector('.ds-virtual-list-visible-items')
+      if (virtualItems) {
+        Array.from(virtualItems.children).forEach(child => {
+          const text = child.textContent?.trim() || ''
+          if (text.length < 10) return
+
+          const hasAssistant = child.querySelector('.ds-assistant-message-main-content')
+          const role: 'user' | 'assistant' = hasAssistant ? 'assistant' : 'user'
+
+          if (!seen.has(text.slice(0, 100))) {
+            seen.add(text.slice(0, 100))
+            messages.push({ role, content: text })
+          }
+        })
+      }
+    }
+  }
+
+  // 将搜索结果附加到最后一个 assistant 消息（仅当 includeSearch 为 true 时）
+  if (includeSearch) {
+    const lastAssistantMsg = messages.filter(m => m.role === 'assistant').pop()
+    if (lastAssistantMsg) {
+      if (searchSummary) lastAssistantMsg.searchSummary = searchSummary
+      if (searchReferences.length > 0) lastAssistantMsg.searchReferences = searchReferences
+      console.log('[DS Exporter] 搜索结果已附加到最后一个 assistant 消息:', { searchSummary, searchReferencesCount: searchReferences.length })
+    } else {
+      console.log('[DS Exporter] 未找到 assistant 消息，搜索结果未附加')
+    }
   }
 
   return messages
 }
 
-function guessRole(text: string): 'user' | 'assistant' {
-  // 用户消息通常较短，以问号结尾
-  if (text.length < 300 && /[？\?]$/.test(text)) return 'user'
-  // 包含代码或较长的通常是 AI
-  if (text.includes('```') || text.length > 500) return 'assistant'
-  return 'user'
-}
-
 // ==================== 自动滚动采集 ====================
+
+// 用于取消导出的 AbortController
+let abortController: AbortController | null = null
+
+/**
+ * 取消正在进行的导出
+ */
+function cancelExport() {
+  if (abortController) {
+    abortController.abort()
+    abortController = null
+    console.log('[DS Exporter] 用户取消导出')
+  }
+}
 
 /**
  * 自动滚动对话区域，触发虚拟列表渲染所有消息，
  * 同时采集每条消息的内容。
  */
-async function scrollAndCollect(): Promise<ParsedMessage[]> {
+async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedMessage[]> {
   const allMessages = new Map<string, ParsedMessage>() // 用内容前100字符去重
   const scrollContainer = document.querySelector('.ds-virtual-list') ||
                           document.querySelector('.ds-scroll-area') ||
@@ -138,25 +571,41 @@ async function scrollAndCollect(): Promise<ParsedMessage[]> {
 
   if (!scrollContainer) {
     console.log('[DS Exporter] 未找到滚动容器')
-    return readVisibleMessages()
+    return readVisibleMessages(includeSearch)
   }
 
   console.log('[DS Exporter] 找到滚动容器，开始滚动采集...')
+
+  // 创建新的 AbortController
+  abortController = new AbortController()
+  const signal = abortController.signal
+
+  // 从页面获取消息（用户+助手）
+  await fetchMessagesFromPage()
+
+  // 检查是否已取消
+  if (signal.aborted) return []
 
   // 记录初始滚动位置
   const initialScrollTop = scrollContainer.scrollTop
 
   // 先滚动到顶部
   scrollContainer.scrollTop = 0
-  await sleep(300)
+  await sleep(300, signal)
 
-  let lastHeight = -1
   let noChangeCount = 0
   const MAX_NO_CHANGE = 3
 
   while (noChangeCount < MAX_NO_CHANGE) {
+    // 检查是否已取消
+    if (signal.aborted) {
+      // 恢复滚动位置
+      scrollContainer.scrollTop = initialScrollTop
+      return []
+    }
+
     // 读取当前可见的消息
-    const visible = readVisibleMessages()
+    const visible = readVisibleMessages(includeSearch)
     for (const msg of visible) {
       const key = msg.content.slice(0, 100)
       if (!allMessages.has(key)) {
@@ -167,7 +616,13 @@ async function scrollAndCollect(): Promise<ParsedMessage[]> {
     // 向下滚动一屏
     const prevScrollTop = scrollContainer.scrollTop
     scrollContainer.scrollTop += scrollContainer.clientHeight * 0.8
-    await sleep(500)
+    await sleep(500, signal)
+
+    // 检查是否已取消
+    if (signal.aborted) {
+      scrollContainer.scrollTop = initialScrollTop
+      return []
+    }
 
     // 检查是否到底
     if (scrollContainer.scrollTop === prevScrollTop ||
@@ -179,7 +634,7 @@ async function scrollAndCollect(): Promise<ParsedMessage[]> {
   }
 
   // 最后再读一次底部的消息
-  const final = readVisibleMessages()
+  const final = readVisibleMessages(includeSearch)
   for (const msg of final) {
     const key = msg.content.slice(0, 100)
     if (!allMessages.has(key)) {
@@ -189,6 +644,9 @@ async function scrollAndCollect(): Promise<ParsedMessage[]> {
 
   // 恢复滚动位置
   scrollContainer.scrollTop = initialScrollTop
+
+  // 清除 AbortController
+  abortController = null
 
   const result = [...allMessages.values()]
   console.log(`[DS Exporter] 滚动采集完成，共 ${result.length} 条消息`)
@@ -209,8 +667,25 @@ function findScrollContainer(): Element | null {
   return null
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
+/**
+ * 支持取消的 sleep 函数
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+
+    const timer = setTimeout(resolve, ms)
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        clearTimeout(timer)
+        resolve()
+      }, { once: true })
+    }
+  })
 }
 
 // ==================== 导出 ====================
@@ -236,8 +711,26 @@ function exportMarkdown(messages: ParsedMessage[], includeThinking: boolean): st
       lines.push(`\n</details>\n`)
     }
 
+    // 搜索结果（作为子标题）
+    if (msg.searchSummary || (msg.searchReferences && msg.searchReferences.length > 0)) {
+      lines.push('### 🔍 网页搜索\n')
+      if (msg.searchSummary) {
+        lines.push(`> ${msg.searchSummary}`)
+      }
+      if (msg.searchReferences && msg.searchReferences.length > 0) {
+        lines.push('\n**搜索来源：**\n')
+        for (const ref of msg.searchReferences) {
+          lines.push(`[${ref.index}] ${ref.url}`)
+        }
+      }
+      lines.push('')
+    }
+
+    // 正文内容（作为子标题）
+    lines.push('### 📝 回答\n')
     lines.push(msg.content)
     lines.push('')
+
     if (i < messages.length - 1) lines.push('---\n')
   }
   return lines.join('\n')
@@ -274,7 +767,34 @@ function exportHtml(messages: ParsedMessage[]): string {
     if (msg.thinking) {
       body += `  <details class="thinking"><summary>🧠 思考过程</summary><pre>${esc(msg.thinking)}</pre></details>\n`
     }
-    body += `  <div class="msg-body">${esc(msg.content)}</div>\n</div>\n`
+
+    // 搜索结果（作为子标题）
+    if (msg.searchSummary || (msg.searchReferences && msg.searchReferences.length > 0)) {
+      body += `  <div class="search-results">\n`
+      body += `    <h3>🔍 网页搜索</h3>\n`
+      if (msg.searchSummary) {
+        body += `    <div class="search-summary">${esc(msg.searchSummary)}</div>\n`
+      }
+      if (msg.searchReferences && msg.searchReferences.length > 0) {
+        body += `    <div class="search-references">\n`
+        body += `      <strong>搜索来源：</strong>\n`
+        body += `      <ul>\n`
+        for (const ref of msg.searchReferences) {
+          body += `        <li><a href="${esc(ref.url)}" target="_blank">[${ref.index}] ${esc(ref.url)}</a></li>\n`
+        }
+        body += `      </ul>\n`
+        body += `    </div>\n`
+      }
+      body += `  </div>\n`
+    }
+
+    // 正文内容（作为子标题）
+    body += `  <div class="msg-section">\n`
+    body += `    <h3>📝 回答</h3>\n`
+    body += `    <div class="msg-body">${esc(msg.content)}</div>\n`
+    body += `  </div>\n`
+
+    body += `</div>\n`
   }
   return `<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><title>DeepSeek 对话导出</title>
@@ -288,6 +808,15 @@ function exportHtml(messages: ParsedMessage[]): string {
   .msg-body{white-space:pre-wrap;word-break:break-word}
   .thinking{margin:10px 0;padding:10px;background:#fff3e0;border-radius:8px}
   .thinking summary{cursor:pointer;font-weight:bold}
+  .msg-section{margin:15px 0}
+  .msg-section h3{margin:0 0 10px 0;font-size:16px;color:#333}
+  .search-results{margin:15px 0;padding:12px;background:#f0f7ff;border-radius:8px;border-left:4px solid #2196f3}
+  .search-results h3{margin:0 0 10px 0;font-size:16px;color:#1565c0}
+  .search-summary{margin-bottom:8px;color:#333}
+  .search-references ul{margin:8px 0 0 20px;padding:0}
+  .search-references li{margin:4px 0}
+  .search-references a{color:#1976d2;text-decoration:none}
+  .search-references a:hover{text-decoration:underline}
   pre{background:#282c34;color:#abb2bf;padding:12px;border-radius:8px;overflow-x:auto}
   table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}th{background:#f5f5f5}
 </style></head><body>
@@ -345,7 +874,10 @@ function injectUI() {
           HTML
         </button>
       </div>
-      <div class="ds-export-status" id="ds-status"></div>
+      <div class="ds-export-status-container">
+        <div class="ds-export-status" id="ds-status"></div>
+        <button class="ds-export-cancel-btn" id="ds-cancel-btn" style="display:none">取消导出</button>
+      </div>
     </div>
   `
   document.body.appendChild(wrapper)
@@ -388,13 +920,21 @@ function injectUI() {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation()
       const format = (e.currentTarget as HTMLElement).dataset.format as string
-      await doExport(format, optThinking.checked)
+      await doExport(format, optThinking.checked, optSearch.checked)
     })
+  })
+
+  // 取消按钮事件
+  const cancelBtn = wrapper.querySelector('#ds-cancel-btn') as HTMLButtonElement
+  cancelBtn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    cancelExport()
   })
 }
 
-async function doExport(format: string, includeThinking: boolean) {
+async function doExport(format: string, includeThinking: boolean, includeSearch: boolean) {
   const statusEl = document.getElementById('ds-status')
+  const cancelBtn = document.getElementById('ds-cancel-btn')
 
   if (isCollecting) {
     showNotification('正在采集中，请稍候...', 'error')
@@ -404,24 +944,41 @@ async function doExport(format: string, includeThinking: boolean) {
   // 如果没有缓存数据，先采集
   if (!cachedMessages || cachedMessages.length === 0) {
     isCollecting = true
+
+    // 显示状态和取消按钮
     if (statusEl) {
       statusEl.textContent = '⏳ 正在滚动采集对话数据...'
       statusEl.className = 'ds-export-status waiting'
     }
+    if (cancelBtn) {
+      cancelBtn.style.display = 'block'
+    }
+
+    // 禁用导出按钮
+    disableExportButtons(true)
 
     try {
-      cachedMessages = await scrollAndCollect()
+      cachedMessages = await scrollAndCollect(includeSearch)
     } catch (e) {
       console.error('[DS Exporter] 采集失败:', e)
       showNotification('采集失败，请重试', 'error')
       isCollecting = false
+      resetExportUI()
       return
     }
     isCollecting = false
+
+    // 检查是否被取消
+    if (cachedMessages.length === 0) {
+      showNotification('导出已取消', 'error')
+      resetExportUI()
+      return
+    }
   }
 
   if (!cachedMessages || cachedMessages.length === 0) {
     showNotification('未找到对话内容', 'error')
+    resetExportUI()
     return
   }
 
@@ -447,7 +1004,33 @@ async function doExport(format: string, includeThinking: boolean) {
   }
 
   showNotification(`已导出 ${cachedMessages.length} 条消息 (${format})`, 'success')
-  document.querySelector('.ds-export-menu')?.setAttribute('style', 'display:none')
+  resetExportUI()
+}
+
+/**
+ * 重置导出 UI 状态
+ */
+function resetExportUI() {
+  const statusEl = document.getElementById('ds-status')
+  const cancelBtn = document.getElementById('ds-cancel-btn')
+
+  if (cancelBtn) {
+    cancelBtn.style.display = 'none'
+  }
+  if (statusEl) {
+    statusEl.textContent = ''
+    statusEl.className = 'ds-export-status'
+  }
+  disableExportButtons(false)
+}
+
+/**
+ * 禁用/启用导出按钮
+ */
+function disableExportButtons(disabled: boolean) {
+  document.querySelectorAll('.ds-export-format').forEach(btn => {
+    (btn as HTMLButtonElement).disabled = disabled
+  })
 }
 
 function showNotification(message: string, type: 'success' | 'error') {
@@ -468,6 +1051,7 @@ function onRouteChange() {
   if (location.href === lastUrl) return
   lastUrl = location.href
   cachedMessages = null // 切换对话时清除缓存
+  pageMessages = [] // 清除页面消息缓存
   console.log('[DS Exporter] 路由变化，缓存已清除')
   if (debounceTimer) clearTimeout(debounceTimer)
   debounceTimer = window.setTimeout(injectUI, 1500)
