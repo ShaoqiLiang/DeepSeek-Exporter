@@ -554,8 +554,19 @@ let abortController: AbortController | null = null
 function cancelExport() {
   if (abortController) {
     abortController.abort()
-    abortController = null
     console.log('[DS Exporter] 用户取消导出')
+
+    // 立即更新 UI 反馈
+    const statusEl = document.getElementById('ds-status')
+    const cancelBtn = document.getElementById('ds-cancel-btn')
+    if (statusEl) {
+      statusEl.textContent = '⏹ 正在取消...'
+      statusEl.className = 'ds-export-status waiting'
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = true
+      cancelBtn.textContent = '取消中...'
+    }
   }
 }
 
@@ -584,14 +595,17 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
   await fetchMessagesFromPage()
 
   // 检查是否已取消
-  if (signal.aborted) return []
+  if (signal.aborted) {
+    abortController = null
+    return []
+  }
 
   // 记录初始滚动位置
   const initialScrollTop = scrollContainer.scrollTop
 
   // 先滚动到顶部
   scrollContainer.scrollTop = 0
-  await sleep(300, signal)
+  await sleep(200, signal)
 
   let noChangeCount = 0
   const MAX_NO_CHANGE = 3
@@ -599,12 +613,12 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
   while (noChangeCount < MAX_NO_CHANGE) {
     // 检查是否已取消
     if (signal.aborted) {
-      // 恢复滚动位置
       scrollContainer.scrollTop = initialScrollTop
+      abortController = null
       return []
     }
 
-    // 读取当前可见的消息
+    // 读取当前可见的消息（使用较短的超时）
     const visible = readVisibleMessages(includeSearch)
     for (const msg of visible) {
       const key = msg.content.slice(0, 100)
@@ -616,12 +630,15 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
     // 向下滚动一屏
     const prevScrollTop = scrollContainer.scrollTop
     scrollContainer.scrollTop += scrollContainer.clientHeight * 0.8
-    await sleep(500, signal)
 
-    // 检查是否已取消
-    if (signal.aborted) {
-      scrollContainer.scrollTop = initialScrollTop
-      return []
+    // 使用更短的 sleep，分段检查取消状态
+    for (let i = 0; i < 5; i++) {
+      await sleep(80, signal)
+      if (signal.aborted) {
+        scrollContainer.scrollTop = initialScrollTop
+        abortController = null
+        return []
+      }
     }
 
     // 检查是否到底
