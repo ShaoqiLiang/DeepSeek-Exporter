@@ -134,13 +134,21 @@ function mergeMessages(existing: any[], incoming: any[]): any[] {
 
 // ==================== 消息提取脚本注入 ====================
 
-async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}> {
+async function injectMessageExtractor(tabId: number): Promise<{messages: any[], debug?: any}> {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId },
       world: 'MAIN',
       func: () => {
         const messages: Array<{role: 'user' | 'assistant', content: string}> = []
+        const debug: any = {
+          foundContainer: false,
+          containerChildren: 0,
+          assistantElements: 0,
+          userElements: 0,
+          directAssistant: 0,
+          directUser: 0
+        }
 
         // 查找所有消息容器（虚拟列表的可见项）
         const virtualItems = document.querySelector('.ds-virtual-list-visible-items') ||
@@ -152,6 +160,8 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
           // 回退：直接查找所有消息元素
           extractFromDirectDOM()
         } else {
+          debug.foundContainer = true
+          debug.containerChildren = chatContainer.children.length
           // 从容器中提取消息
           extractFromContainer(chatContainer)
         }
@@ -170,12 +180,14 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
             const assistantEl = child.querySelector('.ds-assistant-message-main-content')
 
             if (assistantEl) {
+              debug.assistantElements++
               // 助手消息：从 React fiber 提取 Markdown AST
               const content = extractAssistantMarkdown(assistantEl)
               if (content) {
                 messages.push({ role: 'assistant', content: content })
               }
             } else {
+              debug.userElements++
               // 用户消息：提取文本内容
               const userTextEl = child.querySelector('[class*="user-message"]') ||
                                  child.querySelector('[class*="ds-markdown"]') ||
@@ -190,7 +202,9 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
 
         function extractFromDirectDOM() {
           // 查找助手消息
-          document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
+          const assistantEls = document.querySelectorAll('.ds-assistant-message-main-content')
+          debug.directAssistant = assistantEls.length
+          assistantEls.forEach(el => {
             const content = extractAssistantMarkdown(el)
             if (content) {
               messages.push({ role: 'assistant', content: content })
@@ -198,7 +212,9 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
           })
 
           // 查找用户消息（通过排除助手消息的方式）
-          document.querySelectorAll('.ds-message, [class*="message"]').forEach(el => {
+          const messageEls = document.querySelectorAll('.ds-message, [class*="message"]')
+          debug.directUser = messageEls.length
+          messageEls.forEach(el => {
             const hasAssistant = el.querySelector('.ds-assistant-message-main-content')
             if (hasAssistant) return
             const text = (el.textContent || '').trim()
@@ -209,6 +225,7 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
         }
 
         function extractAssistantMarkdown(el: Element): string | null {
+          // 方法1：尝试从 React fiber 提取
           let fiberKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'))
           if (!fiberKey) {
             const child = el.querySelector('[class*="ds-markdown"]') || el.firstElementChild
@@ -221,29 +238,36 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
             }
           }
 
-          if (!fiberKey) return null
+          if (fiberKey) {
+            let fiber = (el as any)[fiberKey]
+            let depth = 0
+            const astNodes: any[] = []
 
-          let fiber = (el as any)[fiberKey]
-          let depth = 0
-          const astNodes: any[] = []
-
-          while (fiber && depth < 30) {
-            const props = fiber.memoizedProps
-            if (props && typeof props === 'object') {
-              if (props.node && typeof props.node === 'object' && props.node.type) {
-                const blockTypes = ['paragraph', 'heading', 'list', 'blockquote', 'code', 'thematicBreak']
-                if (blockTypes.includes(props.node.type)) {
-                  astNodes.push(props.node)
+            while (fiber && depth < 30) {
+              const props = fiber.memoizedProps
+              if (props && typeof props === 'object') {
+                if (props.node && typeof props.node === 'object' && props.node.type) {
+                  const blockTypes = ['paragraph', 'heading', 'list', 'blockquote', 'code', 'thematicBreak']
+                  if (blockTypes.includes(props.node.type)) {
+                    astNodes.push(props.node)
+                  }
                 }
               }
+              fiber = fiber.return
+              depth++
             }
-            fiber = fiber.return
-            depth++
+
+            if (astNodes.length > 0) {
+              return astNodes.map(node => astToMarkdown(node)).join('\n\n')
+            }
           }
 
-          if (astNodes.length > 0) {
-            return astNodes.map(node => astToMarkdown(node)).join('\n\n')
+          // 方法2：直接提取文本内容（回退方案）
+          const textContent = el.textContent?.trim()
+          if (textContent && textContent.length > 0) {
+            return textContent
           }
+
           return null
         }
 
@@ -328,13 +352,15 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[]}>
           }
         }
 
-        return messages
+        return { messages, debug }
       }
     })
 
-    // 返回提取的消息
+    // 返回提取消息和调试信息
     if (results && results[0] && results[0].result) {
-      return { messages: results[0].result }
+      const { messages, debug } = results[0].result
+      console.log('[DS Exporter] 提取调试信息:', debug)
+      return { messages, debug }
     }
     return { messages: [] }
   } catch (err) {

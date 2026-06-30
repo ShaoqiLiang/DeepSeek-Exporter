@@ -125,6 +125,16 @@ async function injectScriptToGetMessages(): Promise<Array<{role: 'user' | 'assis
     const response = await chrome.runtime.sendMessage({
       type: 'INJECT_MESSAGE_EXTRACTOR'
     })
+    if (response?.debug) {
+      console.log('[DS Exporter] 消息提取调试:')
+      console.log('  - 找到容器:', response.debug.foundContainer)
+      console.log('  - 容器子元素数:', response.debug.containerChildren)
+      console.log('  - 容器中的助手元素:', response.debug.assistantElements)
+      console.log('  - 容器中的用户元素:', response.debug.userElements)
+      console.log('  - 直接查找助手元素:', response.debug.directAssistant)
+      console.log('  - 直接查找消息元素:', response.debug.directUser)
+      console.log('  - 提取消息数:', response.messages?.length || 0)
+    }
     return response?.messages || []
   } catch (err) {
     console.log('[DS Exporter] 消息提取失败:', err)
