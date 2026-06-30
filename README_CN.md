@@ -132,10 +132,6 @@ deepseek-exporter/
 1. 确保使用最新构建（`npm run build`）
 2. 重新加载扩展
 
-### key.pem 警告？
-
-这是 Chrome 的安全提醒，本地开发可以安全忽略。详见 [CRX 打包说明](doc/crx-packaging.md)。
-
 ## 许可证
 
 [GNU Affero 通用公共许可证 v3.0 (AGPL-3.0)](LICENSE)

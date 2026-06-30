@@ -121,10 +121,6 @@ This was fixed in recent versions. If you still see errors:
 1. Make sure you're using the latest build (`npm run build`)
 2. Reload the extension
 
-### key.pem warning?
-
-This is a security reminder from Chrome. It's safe to ignore for local development. See [CRX Packaging](doc/crx-packaging.md) for details.
-
 ## License
 
 [GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)
