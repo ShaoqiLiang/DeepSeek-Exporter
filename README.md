@@ -1,74 +1,130 @@
 # DeepSeek Chat Exporter
 
-一键导出 DeepSeek 对话中的多轮问答记录。
+A Chrome extension to export multi-turn Q&A conversations from DeepSeek Chat.
 
-## 功能
+[中文文档](README_CN.md)
 
-- ✅ 导出完整多轮对话（所有问答对）
-- ✅ 支持 Markdown / JSON / HTML 三种格式
-- ✅ 可选导出 DeepThink 思考过程
-- ✅ 可选导出联网搜索结果
-- ✅ 自动检测 DeepSeek 对话页面
-- ✅ 浮动导出按钮 + 弹出面板
+## Features
 
-## 安装（本地开发模式）
+- ✅ Export complete multi-turn conversations (all Q&A pairs)
+- ✅ Support Markdown / JSON / HTML export formats
+- ✅ Optionally include DeepThink reasoning process
+- ✅ Optionally include web search results
+- ✅ Auto-detect DeepSeek chat pages
+- ✅ Floating export button with dropdown menu
+- ✅ Cancel ongoing export process
+- ✅ SPA route change detection
 
-1. 打开 Chrome，访问 `chrome://extensions/`
-2. 右上角打开 **开发者模式**
-3. 点击 **加载已解压的扩展程序**
-4. 选择本项目根目录（包含 `manifest.json` 的文件夹）
+## Installation
 
-## 开发
+### Development Mode (Unpacked)
+
+1. Open Chrome and navigate to `chrome://extensions/`
+2. Enable **Developer mode** (top right toggle)
+3. Click **Load unpacked**
+4. Select the `dist/` folder in this project
+
+### CRX Package (Distribution)
 
 ```bash
-# 安装依赖
+# Build and package
+npm run package
+```
+
+Then drag `build/deepseek-exporter.crx` into Chrome extensions page.
+
+## Development
+
+### Prerequisites
+
+- Node.js >= 18
+- npm >= 9
+
+### Setup
+
+```bash
+# Install dependencies
 npm install
 
-# 构建
+# Build
 npm run build
 
-# 监听文件变化自动构建
+# Watch mode (auto-rebuild on changes)
 npm run watch
 ```
 
-## 使用方法
-
-1. 安装插件后，打开 [DeepSeek 对话页面](https://chat.deepseek.com)
-2. 页面右上角会出现 **导出** 按钮
-3. 选择导出格式（MD / JSON / HTML）
-4. 可勾选是否包含思考过程和搜索结果
-5. 点击格式按钮，自动下载导出文件
-
-也可以点击浏览器工具栏的插件图标，在弹出面板中选择对话并导出。
-
-## 技术方案
-
-- **Manifest V3** Chrome Extension
-- **API 拦截**：通过注入 fetch 拦截器捕获 DeepSeek API 返回的对话数据
-- **DOM 降级**：API 不可用时从页面 DOM 提取内容
-- **SPA 路由监听**：自动检测对话页面切换
-
-## 项目结构
+### Project Structure
 
 ```
-├── manifest.json           # MV3 清单
-├── build.mjs               # esbuild 构建脚本
+deepseek-exporter/
+├── manifest.json              # Chrome Extension manifest
+├── build.mjs                  # Build script (esbuild)
 ├── src/
 │   ├── background/
-│   │   └── service-worker.ts  # API 拦截、导出逻辑
+│   │   └── service-worker.ts  # Background service worker
 │   ├── content/
-│   │   ├── index.ts           # 页面注入、DOM 解析
-│   │   └── style.css          # 按钮样式
+│   │   ├── index.ts           # Content script (core logic)
+│   │   └── style.css          # Injected styles
 │   ├── popup/
-│   │   ├── popup.html         # 弹出面板
-│   │   └── popup.ts           # 面板逻辑
+│   │   ├── popup.html         # Popup UI
+│   │   └── popup.ts           # Popup logic
 │   └── shared/
-│       └── types.ts           # 类型定义
-└── dist/                      # 构建输出
+│       └── types.ts           # TypeScript type definitions
+├── icons/                     # Extension icons
+├── doc/                       # Documentation
+└── dist/                      # Build output
 ```
 
-## 注意事项
+## Usage
 
-- 插件需要在 DeepSeek 对话页面上使用
-- 首次使用需先浏览对话，让插件拦截到 API 数据
-- 如果导出按钮未出现，请刷新页面
+1. Install the extension
+2. Open [DeepSeek Chat](https://chat.deepseek.com)
+3. Click the **Export** button (top right corner)
+4. Select export format (MD / JSON / HTML)
+5. Optionally check "Include thinking process" or "Include search results"
+6. Click the format button to download
+
+You can also click the extension icon in the browser toolbar to open the popup panel.
+
+## Technical Details
+
+- **Manifest V3** Chrome Extension
+- **Message Extraction**: Injects scripts into page's main world via Service Worker to extract messages from React fiber
+- **Role Detection**: Identifies user/assistant messages by DOM structure (`.ds-assistant-message-main-content`)
+- **Content Extraction**: 
+  - Assistant messages: Extracts Markdown AST from React fiber
+  - User messages: Extracts text content directly
+- **SPA Route Listening**: Monitors URL changes to detect conversation switches
+
+## Documentation
+
+- [Build Guide](doc/build-guide.md) - How to build and package
+- [CRX Packaging](doc/crx-packaging.md) - CRX packaging and key.pem explanation
+
+## FAQ
+
+### Export button not appearing?
+
+- Make sure you're on `chat.deepseek.com`
+- Try refreshing the page
+- Check if the extension is enabled in `chrome://extensions/`
+
+### Export is slow or incomplete?
+
+- The extension scrolls through the conversation to load all messages
+- For long conversations, this may take some time
+- You can click "Cancel" to stop the export process
+
+### CSP errors in extensions page?
+
+This was fixed in recent versions. If you still see errors:
+1. Make sure you're using the latest build (`npm run build`)
+2. Reload the extension
+
+### key.pem warning?
+
+This is a security reminder from Chrome. It's safe to ignore for local development. See [CRX Packaging](doc/crx-packaging.md) for details.
+
+## License
+
+[GNU Affero General Public License v3.0 (AGPL-3.0)](LICENSE)
