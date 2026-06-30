@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek Chat Exporter",
-  "version": "1.0.0",
+  "version": "26.06.30",
   "description": "一键导出 DeepSeek 对话中的多轮问答记录",
   "icons": {
     "16": "icons/exporter16.png",
