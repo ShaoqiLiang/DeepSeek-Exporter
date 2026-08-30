@@ -125,20 +125,22 @@ chrome.runtime.onMessage.addListener((msg: any, sender, sendResponse) => {
     }
     try {
       const opts = options || { format: 'markdown', includeThinking: false, includeSearchResults: false }
+      // API 原始消息的思考字段是 thinking_content，统一映射为导出模块使用的 thinking
+      const messages = conv.messages.map((m: any) => ({ ...m, thinking: m.thinking ?? m.thinking_content }))
       const base = `${sanitizeFilename(conv.title || 'deepseek')}_${fileTimestamp()}`
       let content: string
       let filename: string
       let mimeType: string
       if (opts.format === 'json') {
-        content = exportJson(conv.messages)
+        content = exportJson(messages)
         filename = `${base}.json`
         mimeType = 'application/json'
       } else if (opts.format === 'html') {
-        content = exportHtml(conv.messages)
+        content = exportHtml(messages)
         filename = `${base}.html`
         mimeType = 'text/html'
       } else {
-        content = exportMarkdown(conv.messages, !!opts.includeThinking)
+        content = exportMarkdown(messages, !!opts.includeThinking)
         filename = `${base}.md`
         mimeType = 'text/markdown'
       }
@@ -198,27 +200,6 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
           directUser: 0
         }
 
-        // 查找所有消息容器（虚拟列表的可见项）
-        const virtualItems = document.querySelector('.ds-virtual-list-visible-items') ||
-                             document.querySelector('[class*="virtual-list"]')
-        const chatContainer = virtualItems || document.querySelector('[class*="chat-list"]') ||
-                             document.querySelector('[class*="message-list"]')
-
-        if (!chatContainer) {
-          // 回退：直接查找所有消息元素
-          extractFromDirectDOM()
-        } else {
-          debug.foundContainer = true
-          debug.containerChildren = chatContainer.children.length
-          // 从容器中提取消息
-          extractFromContainer(chatContainer)
-        }
-
-        // 如果上面没找到，尝试直接查找 DOM 元素
-        if (messages.length === 0) {
-          extractFromDirectDOM()
-        }
-
         // 提取单条助手消息内部的搜索摘要与引用链接（每条回答各自对应）
         function extractSearchForElement(el: Element) {
           const summaryMatch = (el.textContent || '').match(/已阅读\s*\d+\s*个网页/)
@@ -251,7 +232,9 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
               // 助手消息：从 React fiber 提取 Markdown AST
               const content = extractAssistantMarkdown(assistantEl)
               if (content) {
-                const msg: any = { role: 'assistant', content: content }
+                  const msg: any = { role: 'assistant', content: content }
+                const thinking = extractThinking(child)
+                if (thinking) msg.thinking = thinking
                 const search = extractSearchForElement(assistantEl)
                 if (search.summary) msg.searchSummary = search.summary
                 if (search.references.length > 0) msg.searchReferences = search.references
@@ -301,6 +284,8 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
               const content = extractAssistantMarkdown(el)
               if (content) {
                 const msg: any = { role: 'assistant', content }
+                const thinking = extractThinking(el.closest('[class*="message"]') || el)
+                if (thinking) msg.thinking = thinking
                 const search = extractSearchForElement(el)
                 if (search.summary) msg.searchSummary = search.summary
                 if (search.references.length > 0) msg.searchReferences = search.references
@@ -357,6 +342,13 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
           }
 
           return null
+        }
+
+        // 从消息元素提取思考过程：DeepSeek 渲染在 .ds-think-content 中
+        function extractThinking(itemEl: Element): string | null {
+          const think = itemEl.querySelector('.ds-think-content, [class*="ds-think-content"]')
+          const text = think?.textContent?.trim()
+          return text && text.length > 0 ? text : null
         }
 
         // AST 转换函数
@@ -438,6 +430,17 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
               }
               return node.value || ''
           }
+        }
+
+        // ==== 执行提取：优先虚拟列表容器（每个 child 是一条完整消息），失败再用直接 DOM 兜底 ====
+        const container = document.querySelector('.ds-virtual-list-visible-items')
+        if (container) {
+          debug.foundContainer = true
+          debug.containerChildren = container.children.length
+          extractFromContainer(container)
+        }
+        if (messages.length === 0) {
+          extractFromDirectDOM()
         }
 
         return { messages, debug }

@@ -109,7 +109,7 @@ function astToMarkdown(node: MarkdownNode): string {
 }
 
 // 通过 service worker 注入脚本到页面主世界，提取消息（用户+助手）
-async function injectScriptToGetMessages(): Promise<Array<{role: 'user' | 'assistant', content: string}>> {
+async function injectScriptToGetMessages(): Promise<ParsedMessage[]> {
   try {
     const response = await chrome.runtime.sendMessage({
       type: 'INJECT_MESSAGE_EXTRACTOR'
@@ -229,13 +229,18 @@ async function fetchMessagesFromPage(st: number): Promise<void> {
 
     if (messages.length > 0) {
       console.log('[DS Exporter] 成功获取', messages.length, '条消息')
-      // 合并新消息（去重）
+      // 合并新消息（去重；若旧记录缺思考内容而新抓到带思考，则补上）
       const existingKeys = new Set(pageMessages.map(p => p.message.content.slice(0, 100)))
       messages.forEach((msg, i) => {
         const key = msg.content.slice(0, 100)
-        if (!existingKeys.has(key)) {
+        const existing = existingKeys.has(key)
+          ? pageMessages.find(p => p.message.content.slice(0, 100) === key)
+          : undefined
+        if (!existing) {
           pageMessages.push({ message: msg, st, i })
           existingKeys.add(key)
+        } else if (!existing.message.thinking && msg.thinking) {
+          existing.message.thinking = msg.thinking
         }
       })
       // 还原全局顺序：先按滚动位置，再按批内序号
@@ -268,6 +273,7 @@ function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
       if (!seen.has(key)) {
         seen.add(key)
         const item: ParsedMessage = { role: msg.role, content: msg.content }
+        if (msg.thinking) item.thinking = msg.thinking
         if (includeSearch) {
           if (msg.searchSummary) item.searchSummary = msg.searchSummary
           if (msg.searchReferences) item.searchReferences = msg.searchReferences
@@ -303,6 +309,10 @@ function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
       seen.add(key)
       if (role === 'assistant') {
         const item: ParsedMessage = { role: 'assistant', content: el.textContent!.trim() }
+        // 思考过程在 .ds-think-content 中，位于同一消息条目内（与回答主体平级）
+        const itemEl = el.closest('.ds-message') || el.closest('[class*="message"]') || el
+        const thinkText = itemEl.querySelector('.ds-think-content, [class*="ds-think-content"]')?.textContent?.trim()
+        if (thinkText) item.thinking = thinkText
         if (includeSearch) {
           const summaryMatch = el.textContent?.match(/已阅读\s*\d+\s*个网页/)
           if (summaryMatch) item.searchSummary = summaryMatch[0]
