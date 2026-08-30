@@ -1,0 +1,123 @@
+﻿*** Begin Patch
+*** Update File: src/content/index.ts
+@@ function exportMarkdown @@
+ function exportMarkdown(messages: ParsedMessage[], includeThinking: boolean): string {
+   const lines: string[] = []
+-  lines.push(`# DeepSeek 对话导出\n`)
+-  lines.push(`> 导出时间：${getLocalTimeString()}`)
+-  lines.push(`> 消息数：${messages.length} 条\n`)
+-  lines.push('---\n')
+-
+-  for (let i = 0; i < messages.length; i++) {
+-    const msg = messages[i]
+-    const isUser = msg.role === 'user'
+-    lines.push(`## ${isUser ? '👤 用户' : '🐋 DeepSeek'}\n`)
+-
+-    if (includeThinking && msg.thinking) {
+-      lines.push(`<details>\n<summary>🧠 思考过程</summary>\n`)
+-      lines.push(msg.thinking)
+-      lines.push(`\n</details>\n`)
+-    }
+-
+-    // 搜索结果（作为子标题）
+-    if (msg.searchSummary || (msg.searchReferences && msg.searchReferences.length > 0)) {
+-      lines.push('### 🔍 网页搜索\n')
+-      if (msg.searchSummary) {
+-        lines.push(`> ${msg.searchSummary}`)
+-      }
+-      if (msg.searchReferences && msg.searchReferences.length > 0) {
+-        lines.push('\n**搜索来源：**\n')
+-        for (const ref of msg.searchReferences) {
+-          lines.push(`[${ref.index}] ${ref.url}`)
+-        }
+-      }
+-      lines.push('')
+-    }
+-
+-    // 正文内容（作为子标题）
+-    lines.push('### 📝 回答\n')
+-    lines.push(msg.content)
+-    lines.push('')
+-
+-    if (i < messages.length - 1) lines.push('---\n')
+-  }
+-  return lines.join('\n')
++  lines.push(`# DeepSeek 对话导出`)
++  lines.push(`> 导出时间：${getLocalTimeString()}`)
++  lines.push(`> 消息数：${messages.length} 条`)
++  lines.push('')
++
++  // 将消息配对成 Q&A 组
++  const pairs: Array<{ user: ParsedMessage | null, assistant: ParsedMessage | null }> = []
++  let i = 0
++  while (i < messages.length) {
++    if (messages[i].role === 'user') {
++      const userMsg = messages[i]
++      const nextMsg = (i + 1 < messages.length && messages[i + 1].role === 'assistant') ? messages[i + 1] : null
++      pairs.push({ user: userMsg, assistant: nextMsg })
++      i += nextMsg ? 2 : 1
++    } else {
++      // 脱落的 assistant 消息
++      pairs.push({ user: null, assistant: messages[i] })
++      i++
++    }
++  }
++
++  for (let p = 0; p < pairs.length; p++) {
++    const { user, assistant } = pairs[p]
++
++    // 一级标题：用户问题摘要
++    if (user) {
++      const titleText = user.content.split('\n')[0].replace(/[#>*`~\[\]]/g, '').slice(0, 80)
++      lines.push(`# ${titleText}`)
++      lines.push('')
++      lines.push(`## 👤 提问`)
++      lines.push('')
++      lines.push(user.content)
++      lines.push('')
++    }
++
++    if (assistant) {
++      lines.push(`## 🤖 回答`)
++      lines.push('')
++
++      if (includeThinking && assistant.thinking) {
++        lines.push(`### 🧠 思考过程`)
++        lines.push('')
++        lines.push(`<details>`)
++        lines.push(`<summary>点击展开思考过程</summary>`)
++        lines.push('')
++        lines.push(assistant.thinking)
++        lines.push('')
++        lines.push(`</details>`)
++        lines.push('')
++      }
++
++      if (assistant.searchSummary || (assistant.searchReferences && assistant.searchReferences.length > 0)) {
++        lines.push('### 🔍 网页搜索')
++        lines.push('')
++        if (assistant.searchSummary) {
++          lines.push(`> ${assistant.searchSummary}`)
++        }
++        if (assistant.searchReferences && assistant.searchReferences.length > 0) {
++          lines.push('')
++          lines.push('**搜索来源：**')
++          lines.push('')
++          for (const ref of assistant.searchReferences) {
++            lines.push(`[${ref.index}] ${ref.url}`)
++          }
++        }
++        lines.push('')
++      }
++
++      lines.push(assistant.content)
++      lines.push('')
++    }
++
++    if (p < pairs.length - 1) lines.push('---')
++    lines.push('')
++  }
++
++  return lines.join('\n')
+ }
+*** End Patch

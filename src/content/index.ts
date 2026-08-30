@@ -3,19 +3,8 @@
 
 console.log('[DS Exporter] Fiber Reader 方案启动')
 
-interface SearchReference {
-  index: number
-  url: string
-  title?: string
-}
-
-interface ParsedMessage {
-  role: 'user' | 'assistant'
-  content: string
-  thinking?: string
-  searchSummary?: string
-  searchReferences?: SearchReference[]
-}
+import type { ParsedMessage, SearchReference } from '../shared/types.js'
+import { exportMarkdown, exportJson, exportHtml } from '../shared/exporters.js'
 
 // ==================== 从 React fiber 读取内容 ====================
 
@@ -228,10 +217,12 @@ function captureSearchResults(): { summary: string | null, references: SearchRef
 // ==================== 读取当前可见的消息 ====================
 
 // 全局变量存储从页面提取消息的结果
-let pageMessages: Array<{role: 'user' | 'assistant', content: string}> = []
+// st = 采集时滚动容器的 scrollTop（越小越靠对话开头），i = 本批次内的序号
+// 虚拟列表滚动时不断换页，每屏抓一次，最后按 (st, i) 还原全局顺序
+let pageMessages: Array<{ message: ParsedMessage, st: number, i: number }> = []
 
 // 从页面获取消息（用户+助手）
-async function fetchMessagesFromPage(): Promise<void> {
+async function fetchMessagesFromPage(st: number): Promise<void> {
   try {
     console.log('[DS Exporter] 尝试从页面获取消息...')
     const messages = await injectScriptToGetMessages()
@@ -239,14 +230,16 @@ async function fetchMessagesFromPage(): Promise<void> {
     if (messages.length > 0) {
       console.log('[DS Exporter] 成功获取', messages.length, '条消息')
       // 合并新消息（去重）
-      const existingKeys = new Set(pageMessages.map(m => m.content.slice(0, 100)))
-      for (const msg of messages) {
+      const existingKeys = new Set(pageMessages.map(p => p.message.content.slice(0, 100)))
+      messages.forEach((msg, i) => {
         const key = msg.content.slice(0, 100)
         if (!existingKeys.has(key)) {
-          pageMessages.push(msg)
+          pageMessages.push({ message: msg, st, i })
           existingKeys.add(key)
         }
-      }
+      })
+      // 还原全局顺序：先按滚动位置，再按批内序号
+      pageMessages.sort((a, b) => (a.st - b.st) || (a.i - b.i))
     } else {
       console.log('[DS Exporter] 未能获取消息，将使用 DOM 提取')
     }
@@ -268,13 +261,18 @@ function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
     searchReferences = result.references
   }
 
-  // 优先使用从注入脚本获取的结构化消息
+  // 优先使用从注入脚本获取的结构化消息（已按滚动位置排好序）
   if (pageMessages.length > 0) {
-    for (const msg of pageMessages) {
+    for (const { message: msg } of pageMessages) {
       const key = msg.content.slice(0, 100)
       if (!seen.has(key)) {
         seen.add(key)
-        messages.push({ role: msg.role, content: msg.content })
+        const item: ParsedMessage = { role: msg.role, content: msg.content }
+        if (includeSearch) {
+          if (msg.searchSummary) item.searchSummary = msg.searchSummary
+          if (msg.searchReferences) item.searchReferences = msg.searchReferences
+        }
+        messages.push(item)
       }
     }
     console.log('[DS Exporter] 使用页面消息:', messages.length, '条')
@@ -282,25 +280,52 @@ function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
 
   // 如果页面消息为空，回退到 DOM 提取
   if (messages.length === 0) {
-    // 查找助手消息
-    document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
-      const text = el.textContent?.trim() || ''
-      if (text && !seen.has(text.slice(0, 100))) {
-        seen.add(text.slice(0, 100))
-        messages.push({ role: 'assistant', content: text })
-      }
-    })
+    // 汇总助手/用户消息元素，按 DOM 真实顺序排序后再提取，保证提问在回答之前
+    const items: Array<{ el: Element, role: 'user' | 'assistant' }> = []
 
-    // 查找用户消息
+    document.querySelectorAll('.ds-assistant-message-main-content').forEach(el => {
+      items.push({ el, role: 'assistant' })
+    })
     document.querySelectorAll('.ds-message, [class*="message"]').forEach(el => {
-      const hasAssistant = el.querySelector('.ds-assistant-message-main-content')
-      if (hasAssistant) return
+      if (el.querySelector('.ds-assistant-message-main-content')) return
       const text = el.textContent?.trim() || ''
-      if (text.length > 0 && !seen.has(text.slice(0, 100))) {
-        seen.add(text.slice(0, 100))
-        messages.push({ role: 'user', content: text })
+      if (text.length > 0 && text.length < 5000) {
+        items.push({ el, role: 'user' })
       }
     })
+    items.sort((a, b) =>
+      (a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1
+    )
+
+    for (const { el, role } of items) {
+      const key = (el.textContent?.trim() || '').slice(0, 100)
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      if (role === 'assistant') {
+        const item: ParsedMessage = { role: 'assistant', content: el.textContent!.trim() }
+        if (includeSearch) {
+          const summaryMatch = el.textContent?.match(/已阅读\s*\d+\s*个网页/)
+          if (summaryMatch) item.searchSummary = summaryMatch[0]
+          const refs: SearchReference[] = []
+          const seenUrls = new Set<string>()
+          el.querySelectorAll('a[href]').forEach(a => {
+            const href = (a as HTMLAnchorElement).href
+            if (href.startsWith('http') && !href.includes('deepseek.com') && !seenUrls.has(href)) {
+              const m = (a.textContent || '').trim().match(/^[-]?(\d+)$/)
+              if (m) {
+                seenUrls.add(href)
+                refs.push({ index: parseInt(m[1]), url: href })
+              }
+            }
+          })
+          refs.sort((x, y) => x.index - y.index)
+          if (refs.length > 0) item.searchReferences = refs
+        }
+        messages.push(item)
+      } else {
+        messages.push({ role: 'user', content: el.textContent!.trim() })
+      }
+    }
 
     // 最后回退：从虚拟列表中获取
     if (messages.length === 0) {
@@ -322,8 +347,8 @@ function readVisibleMessages(includeSearch: boolean = false): ParsedMessage[] {
     }
   }
 
-  // 将搜索结果附加到最后一个 assistant 消息（仅当 includeSearch 为 true 时）
-  if (includeSearch) {
+  // 兜底：如果逐条提取没拿到任何引用，才整页抓一次挂到最后一条回答
+  if (includeSearch && !messages.some(m => m.searchReferences && m.searchReferences.length > 0)) {
     const lastAssistantMsg = messages.filter(m => m.role === 'assistant').pop()
     if (lastAssistantMsg) {
       if (searchSummary) lastAssistantMsg.searchSummary = searchSummary
@@ -358,7 +383,7 @@ function cancelExport() {
       statusEl.className = 'ds-export-status waiting'
     }
     if (cancelBtn) {
-      cancelBtn.disabled = true
+      ;(cancelBtn as HTMLButtonElement).disabled = true
       cancelBtn.textContent = '取消中...'
     }
   }
@@ -385,8 +410,8 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
   abortController = new AbortController()
   const signal = abortController.signal
 
-  // 从页面获取消息（用户+助手）
-  await fetchMessagesFromPage()
+  // 从页面获取消息（用户+助手）——点击导出时可见的这一屏
+  await fetchMessagesFromPage(scrollContainer.scrollTop)
 
   // 检查是否已取消
   if (signal.aborted) {
@@ -397,9 +422,9 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
   // 记录初始滚动位置
   const initialScrollTop = scrollContainer.scrollTop
 
-  // 先滚动到顶部
+  // 先滚动到顶部（等虚拟列表渲染出开头的消息）
   scrollContainer.scrollTop = 0
-  await sleep(200, signal)
+  await sleep(500, signal)
 
   let noChangeCount = 0
   const MAX_NO_CHANGE = 3
@@ -411,6 +436,9 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
       abortController = null
       return []
     }
+
+    // 每一屏都重新提取，虚拟列表换页后新消息才会进入缓存
+    await fetchMessagesFromPage(scrollContainer.scrollTop)
 
     // 读取当前可见的消息（使用较短的超时）
     const visible = readVisibleMessages(includeSearch)
@@ -444,14 +472,8 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
     }
   }
 
-  // 最后再读一次底部的消息
-  const final = readVisibleMessages(includeSearch)
-  for (const msg of final) {
-    const key = msg.content.slice(0, 100)
-    if (!allMessages.has(key)) {
-      allMessages.set(key, msg)
-    }
-  }
+  // 最后再抓取并读一次底部的消息
+  await fetchMessagesFromPage(scrollContainer.scrollTop)
 
   // 恢复滚动位置
   scrollContainer.scrollTop = initialScrollTop
@@ -459,7 +481,8 @@ async function scrollAndCollect(includeSearch: boolean = false): Promise<ParsedM
   // 清除 AbortController
   abortController = null
 
-  const result = [...allMessages.values()]
+  // pageMessages 已全局去重且按 (滚动位置, 批内序号) 排序，直接以最后一次读取为准
+  const result = readVisibleMessages(includeSearch)
   console.log(`[DS Exporter] 滚动采集完成，共 ${result.length} 条消息`)
   return result
 }
@@ -502,139 +525,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 // ==================== 导出 ====================
 
 let cachedMessages: ParsedMessage[] | null = null
+let cachedMessagesUrl: string | null = null
 let isCollecting = false
-
-function exportMarkdown(messages: ParsedMessage[], includeThinking: boolean): string {
-  const lines: string[] = []
-  lines.push(`# DeepSeek 对话导出\n`)
-  lines.push(`> 导出时间：${getLocalTimeString()}`)
-  lines.push(`> 消息数：${messages.length} 条\n`)
-  lines.push('---\n')
-
-  for (let i = 0; i < messages.length; i++) {
-    const msg = messages[i]
-    const isUser = msg.role === 'user'
-    lines.push(`## ${isUser ? '👤 用户' : '🐋 DeepSeek'}\n`)
-
-    if (includeThinking && msg.thinking) {
-      lines.push(`<details>\n<summary>🧠 思考过程</summary>\n`)
-      lines.push(msg.thinking)
-      lines.push(`\n</details>\n`)
-    }
-
-    // 搜索结果（作为子标题）
-    if (msg.searchSummary || (msg.searchReferences && msg.searchReferences.length > 0)) {
-      lines.push('### 🔍 网页搜索\n')
-      if (msg.searchSummary) {
-        lines.push(`> ${msg.searchSummary}`)
-      }
-      if (msg.searchReferences && msg.searchReferences.length > 0) {
-        lines.push('\n**搜索来源：**\n')
-        for (const ref of msg.searchReferences) {
-          lines.push(`[${ref.index}] ${ref.url}`)
-        }
-      }
-      lines.push('')
-    }
-
-    // 正文内容（作为子标题）
-    lines.push('### 📝 回答\n')
-    lines.push(msg.content)
-    lines.push('')
-
-    if (i < messages.length - 1) lines.push('---\n')
-  }
-  return lines.join('\n')
-}
-
-function getLocalTimeString(): string {
-  const now = new Date()
-  const year = now.getFullYear()
-  const month = String(now.getMonth() + 1).padStart(2, '0')
-  const day = String(now.getDate()).padStart(2, '0')
-  const hours = String(now.getHours()).padStart(2, '0')
-  const minutes = String(now.getMinutes()).padStart(2, '0')
-  const seconds = String(now.getSeconds()).padStart(2, '0')
-  return `${year}/${month}/${day} ${hours}:${minutes}:${seconds}`
-}
-
-function exportJson(messages: ParsedMessage[]): string {
-  return JSON.stringify({
-    exported_at: getLocalTimeString(),
-    url: location.href,
-    message_count: messages.length,
-    messages
-  }, null, 2)
-}
-
-function exportHtml(messages: ParsedMessage[]): string {
-  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-  const deepseekIcon = `<svg viewBox="0 0 1024 1024" width="20" height="20" style="vertical-align:middle;margin-right:6px"><path d="M0 0m146.285714 0l731.428572 0q146.285714 0 146.285714 146.285714l0 731.428572q0 146.285714-146.285714 146.285714l-731.428572 0q-146.285714 0-146.285714-146.285714l0-731.428572q0-146.285714 146.285714-146.285714Z" fill="#FFFFFF"/><path d="M834.194286 329.106286c-6.948571-3.401143-9.947429 3.072-14.006857 6.326857-1.426286 1.024-2.56 2.413714-3.766858 3.657143-10.24 10.788571-22.089143 17.846857-37.668571 17.005714-22.710857-1.28-42.166857 5.814857-59.318857 23.003429-3.657143-21.211429-15.725714-33.865143-34.230857-41.984-9.654857-4.205714-19.382857-8.411429-26.148572-17.627429-4.754286-6.546286-5.997714-13.824-8.338285-20.955429-1.536-4.352-2.998857-8.777143-8.045715-9.508571-5.485714-0.841143-7.643429 3.693714-9.801143 7.497143-8.594286 15.506286-11.885714 32.548571-11.556571 49.883428 0.731429 38.948571 17.334857 69.888 50.395429 91.940572 3.730286 2.56 4.754286 5.083429 3.547428 8.777143-2.267429 7.570286-4.937143 14.994286-7.314286 22.564571-1.462857 4.864-3.730286 5.924571-8.996571 3.803429a151.881143 151.881143 0 0 1-47.652571-31.963429c-23.478857-22.491429-44.726857-47.250286-71.204572-66.669714a316.233143 316.233143 0 0 0-18.870857-12.763429c-27.062857-25.965714 3.510857-47.213714 10.605714-49.773714 7.387429-2.633143 2.56-11.702857-21.357714-11.593143-23.917714 0.109714-45.824 8.045714-73.691429 18.578286-4.132571 1.536-8.411429 2.779429-12.763428 3.657143a266.422857 266.422857 0 0 0-79.067429-2.742857c-51.712 5.705143-92.964571 29.842286-123.392 71.094857-36.461714 49.554286-45.056 105.910857-34.486857 164.644571 10.971429 61.915429 43.008 113.152 92.16 153.234286 50.907429 41.581714 109.568 61.915429 176.530286 58.002286 40.667429-2.304 85.942857-7.68 136.996571-50.432 12.836571 6.363429 26.368 8.886857 48.786286 10.788571 17.298286 1.609143 33.938286-0.841143 46.811429-3.510857 20.114286-4.169143 18.761143-22.674286 11.483428-26.002286-59.136-27.245714-46.153143-16.164571-57.929143-25.124571 29.988571-35.108571 75.300571-71.606857 92.964572-189.842286 1.426286-9.398857 0.219429-15.286857 0-22.893714-0.109714-4.608 0.987429-6.4 6.363428-6.948572 14.848-1.536 29.257143-5.888 42.349715-12.873143 38.326857-20.662857 53.76-54.637714 57.417142-95.341714 0.548571-6.217143-0.109714-12.653714-6.765714-15.945143z m-333.677715 366.409143c-57.307429-44.544-85.065143-59.245714-96.548571-58.587429-10.752 0.658286-8.813714 12.8-6.473143 20.699429 2.450286 7.826286 5.668571 13.165714 10.24 20.041142 3.072 4.534857 5.229714 11.264-3.181714 16.347429-18.432 11.300571-50.468571-3.803429-51.968-4.534857-37.376-21.686857-68.571429-50.432-90.550857-89.673143a271.36 271.36 0 0 1-35.620572-121.453714c-0.548571-10.459429 2.56-14.153143 13.056-16.091429a130.450286 130.450286 0 0 1 41.947429-1.024c58.514286 8.448 108.251429 34.267429 150.016 75.190857 23.771429 23.296 41.801143 51.2 60.342857 78.372572 19.748571 28.891429 40.996571 56.429714 68.022857 78.994285 9.581714 7.899429 17.152 13.933714 24.502857 18.358858-22.016 2.413714-58.697143 2.925714-83.785143-16.676572z m27.428572-174.592c0-5.705143 5.851429-9.728 11.373714-7.789715a8.265143 8.265143 0 0 1 1.024 15.177143 8.777143 8.777143 0 0 1-7.277714 0.292572 8.192 8.192 0 0 1-5.12-7.68z m85.284571 43.264c-5.12 2.340571-10.605714 3.803429-16.201143 4.315428a34.450286 34.450286 0 0 1-21.869714-6.838857c-7.497143-6.217143-12.873143-9.728-15.140571-20.553143a46.811429 46.811429 0 0 1 0.438857-15.981714c1.938286-8.850286-0.219429-14.518857-6.582857-19.675429-5.12-4.205714-11.702857-5.412571-18.870857-5.412571a15.286857 15.286857 0 0 1-9.289143-3.803429 6.656 6.656 0 0 1-1.645715-5.302857 6.619429 6.619429 0 0 1 0.877715-2.706286 30.354286 30.354286 0 0 1 5.302857-5.668571c9.728-5.485714 20.992-3.693714 31.414857 0.402286 9.618286 3.913143 16.896 11.081143 27.428571 21.211428 10.752 12.214857 12.690286 15.616 18.797715 24.795429 4.827429 7.131429 9.216 14.555429 12.178285 22.966857 1.828571 5.266286-0.512 9.581714-6.802285 12.251429z" fill="#4D6BFE"/></svg>`
-  let body = ''
-  for (const msg of messages) {
-    const isUser = msg.role === 'user'
-    body += `<div class="msg ${msg.role}">\n`
-    body += `  <div class="msg-header">${isUser ? '👤 用户' : deepseekIcon + 'DeepSeek'}</div>\n`
-    if (msg.thinking) {
-      body += `  <details class="thinking"><summary>🧠 思考过程</summary><pre>${esc(msg.thinking)}</pre></details>\n`
-    }
-
-    // 搜索结果（作为子标题）
-    if (msg.searchSummary || (msg.searchReferences && msg.searchReferences.length > 0)) {
-      body += `  <div class="search-results">\n`
-      body += `    <h3>🔍 网页搜索</h3>\n`
-      if (msg.searchSummary) {
-        body += `    <div class="search-summary">${esc(msg.searchSummary)}</div>\n`
-      }
-      if (msg.searchReferences && msg.searchReferences.length > 0) {
-        body += `    <div class="search-references">\n`
-        body += `      <strong>搜索来源：</strong>\n`
-        body += `      <ul>\n`
-        for (const ref of msg.searchReferences) {
-          body += `        <li><a href="${esc(ref.url)}" target="_blank">[${ref.index}] ${esc(ref.url)}</a></li>\n`
-        }
-        body += `      </ul>\n`
-        body += `    </div>\n`
-      }
-      body += `  </div>\n`
-    }
-
-    // 正文内容（作为子标题）
-    body += `  <div class="msg-section">\n`
-    body += `    <h3>📝 回答</h3>\n`
-    body += `    <div class="msg-body">${esc(msg.content)}</div>\n`
-    body += `  </div>\n`
-
-    body += `</div>\n`
-  }
-  return `<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><title>DeepSeek 对话导出</title>
-<style>
-  body{max-width:800px;margin:0 auto;padding:20px;font-family:-apple-system,sans-serif;line-height:1.6;color:#333}
-  h1{text-align:center}.meta{text-align:center;color:#666;margin-bottom:30px}
-  .msg{margin:20px 0;padding:16px;border-radius:12px}
-  .msg.user{background:#e3f2fd;border-left:4px solid #2196f3}
-  .msg.assistant{background:#f5f5f5;border-left:4px solid #4caf50}
-  .msg-header{font-weight:bold;margin-bottom:8px;display:flex;align-items:center}
-  .msg-body{white-space:pre-wrap;word-break:break-word}
-  .thinking{margin:10px 0;padding:10px;background:#fff3e0;border-radius:8px}
-  .thinking summary{cursor:pointer;font-weight:bold}
-  .msg-section{margin:15px 0}
-  .msg-section h3{margin:0 0 10px 0;font-size:16px;color:#333}
-  .search-results{margin:15px 0;padding:12px;background:#f0f7ff;border-radius:8px;border-left:4px solid #2196f3}
-  .search-results h3{margin:0 0 10px 0;font-size:16px;color:#1565c0}
-  .search-summary{margin-bottom:8px;color:#333}
-  .search-references ul{margin:8px 0 0 20px;padding:0}
-  .search-references li{margin:4px 0}
-  .search-references a{color:#1976d2;text-decoration:none}
-  .search-references a:hover{text-decoration:underline}
-  pre{background:#282c34;color:#abb2bf;padding:12px;border-radius:8px;overflow-x:auto}
-  table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}th{background:#f5f5f5}
-</style></head><body>
-<h1>📤 DeepSeek 对话导出</h1>
-<div class="meta">导出时间：${getLocalTimeString()} · ${messages.length} 条消息</div>
-${body}</body></html>`
-}
 
 function triggerDownload(content: string, filename: string, mimeType: string) {
   const blob = new Blob([content], { type: mimeType })
@@ -752,6 +644,12 @@ async function doExport(format: string, includeThinking: boolean, includeSearch:
     return
   }
 
+  // 缓存属于别的对话时强制重新采集，防止切换对话后导出旧数据
+  if (cachedMessages && cachedMessagesUrl !== location.href) {
+    console.log('[DS Exporter] URL 已变化，丢弃旧对话缓存')
+    cachedMessages = null
+  }
+
   // 如果没有缓存数据，先采集
   if (!cachedMessages || cachedMessages.length === 0) {
     isCollecting = true
@@ -770,6 +668,7 @@ async function doExport(format: string, includeThinking: boolean, includeSearch:
 
     try {
       cachedMessages = await scrollAndCollect(includeSearch)
+      cachedMessagesUrl = location.href
     } catch (e) {
       console.error('[DS Exporter] 采集失败:', e)
       showNotification('采集失败，请重试', 'error')
@@ -807,7 +706,7 @@ async function doExport(format: string, includeThinking: boolean, includeSearch:
       triggerDownload(exportMarkdown(cachedMessages, includeThinking), `${title}_${ts}.md`, 'text/markdown')
       break
     case 'json':
-      triggerDownload(exportJson(cachedMessages), `${title}_${ts}.json`, 'application/json')
+      triggerDownload(exportJson(cachedMessages, location.href), `${title}_${ts}.json`, 'application/json')
       break
     case 'html':
       triggerDownload(exportHtml(cachedMessages), `${title}_${ts}.html`, 'text/html')
@@ -862,10 +761,11 @@ function onRouteChange() {
   if (location.href === lastUrl) return
   lastUrl = location.href
   cachedMessages = null // 切换对话时清除缓存
+  cachedMessagesUrl = null
   pageMessages = [] // 清除页面消息缓存
   console.log('[DS Exporter] 路由变化，缓存已清除')
   if (debounceTimer) clearTimeout(debounceTimer)
-  debounceTimer = window.setTimeout(injectUI, 1500)
+  debounceTimer = window.setTimeout(() => { debounceTimer = null; injectUI() }, 1500)
 }
 
 window.addEventListener('popstate', onRouteChange)
@@ -881,6 +781,7 @@ function setupObserver() {
       if (debounceTimer) return
       debounceTimer = window.setTimeout(() => { debounceTimer = null; onRouteChange() }, 500)
     }).observe(document.body, { childList: true, subtree: true })
+    // onRouteChange 内的 injectUI 定时器触发后同样要清空，否则会永久阻塞 Observer
   }
 }
 

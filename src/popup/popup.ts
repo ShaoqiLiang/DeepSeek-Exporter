@@ -116,8 +116,11 @@ async function handleExport(format: 'markdown' | 'json' | 'html') {
 
     if (response?.error) {
       showStatus(response.error, 'error')
-    } else if (response?.success) {
+    } else if (response?.success && response.content) {
+      downloadFile(response.content, response.filename, response.mimeType)
       showStatus(`已导出：${response.filename}`, 'success')
+    } else {
+      showStatus('导出失败：后台未返回数据', 'error')
     }
   } catch (err: any) {
     showStatus(`导出失败：${err.message}`, 'error')
@@ -137,6 +140,17 @@ function enableExportButtons(enabled: boolean) {
 function showStatus(message: string, type?: 'success' | 'error') {
   statusEl.textContent = message
   statusEl.className = `status ${type || ''}`
+}
+
+// 通过 Blob + 隐藏链接触发浏览器下载
+function downloadFile(content: string, filename: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 function escapeHtml(text: string): string {

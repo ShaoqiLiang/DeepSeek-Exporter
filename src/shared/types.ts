@@ -26,6 +26,21 @@ export interface ConversationMeta {
   message_count?: number
 }
 
+// 内容脚本解析后的消息结构（导出模块共用）
+export interface SearchReference {
+  index: number
+  url: string
+  title?: string
+}
+
+export interface ParsedMessage {
+  role: 'user' | 'assistant'
+  content: string
+  thinking?: string
+  searchSummary?: string
+  searchReferences?: SearchReference[]
+}
+
 // 导出选项
 export interface ExportOptions {
   format: 'markdown' | 'json' | 'html'

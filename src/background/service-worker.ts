@@ -3,6 +3,8 @@
 
 console.log('[DS Exporter] Service worker 启动')
 
+import { exportMarkdown, exportJson, exportHtml, fileTimestamp, sanitizeFilename } from '../shared/exporters.js'
+
 // ==================== 注入 fetch 拦截器 ====================
 
 // chrome.scripting.executeScript 不受 CSP 限制
@@ -101,6 +103,52 @@ chrome.runtime.onMessage.addListener((msg: any, sender, sendResponse) => {
     return
   }
 
+  // popup 请求对话列表
+  if (msg.type === 'GET_CONVERSATION_LIST') {
+    sendResponse({
+      conversations: [...capturedData.values()].map(d => ({
+        chat_id: d.chatId,
+        title: d.title || '未命名对话',
+        message_count: d.messages.length
+      }))
+    })
+    return
+  }
+
+  // popup 请求导出：生成文件内容，由 popup 负责触发下载
+  if (msg.type === 'REQUEST_EXPORT') {
+    const { chatId, options } = msg.payload || {}
+    const conv = chatId ? capturedData.get(chatId) : undefined
+    if (!conv) {
+      sendResponse({ error: '未找到该对话的数据，请先在 DeepSeek 页面打开一次对话' })
+      return
+    }
+    try {
+      const opts = options || { format: 'markdown', includeThinking: false, includeSearchResults: false }
+      const base = `${sanitizeFilename(conv.title || 'deepseek')}_${fileTimestamp()}`
+      let content: string
+      let filename: string
+      let mimeType: string
+      if (opts.format === 'json') {
+        content = exportJson(conv.messages)
+        filename = `${base}.json`
+        mimeType = 'application/json'
+      } else if (opts.format === 'html') {
+        content = exportHtml(conv.messages)
+        filename = `${base}.html`
+        mimeType = 'text/html'
+      } else {
+        content = exportMarkdown(conv.messages, !!opts.includeThinking)
+        filename = `${base}.md`
+        mimeType = 'text/markdown'
+      }
+      sendResponse({ success: true, filename, content, mimeType })
+    } catch (e: any) {
+      sendResponse({ error: `导出失败：${e?.message || e}` })
+    }
+    return
+  }
+
   // 请求注入拦截器（content script 发起）
   if (msg.type === 'INJECT_INTERCEPTOR') {
     const tabId = sender.tab?.id
@@ -171,6 +219,25 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
           extractFromDirectDOM()
         }
 
+        // 提取单条助手消息内部的搜索摘要与引用链接（每条回答各自对应）
+        function extractSearchForElement(el: Element) {
+          const summaryMatch = (el.textContent || '').match(/已阅读\s*\d+\s*个网页/)
+          const refs: Array<{index: number, url: string}> = []
+          const seenUrls = new Set<string>()
+          el.querySelectorAll('a[href]').forEach(a => {
+            const href = (a as HTMLAnchorElement).href
+            if (href.startsWith('http') && !href.includes('deepseek.com') && !seenUrls.has(href)) {
+              const m = (a.textContent || '').trim().match(/^[-]?(\d+)$/)
+              if (m) {
+                seenUrls.add(href)
+                refs.push({ index: parseInt(m[1]), url: href })
+              }
+            }
+          })
+          refs.sort((a, b) => a.index - b.index)
+          return { summary: summaryMatch ? summaryMatch[0] : null, references: refs }
+        }
+
         function extractFromContainer(container: Element) {
           Array.from(container.children).forEach(child => {
             // 跳过太小的元素
@@ -184,7 +251,11 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
               // 助手消息：从 React fiber 提取 Markdown AST
               const content = extractAssistantMarkdown(assistantEl)
               if (content) {
-                messages.push({ role: 'assistant', content: content })
+                const msg: any = { role: 'assistant', content: content }
+                const search = extractSearchForElement(assistantEl)
+                if (search.summary) msg.searchSummary = search.summary
+                if (search.references.length > 0) msg.searchReferences = search.references
+                messages.push(msg)
               }
             } else {
               debug.userElements++
@@ -201,27 +272,44 @@ async function injectMessageExtractor(tabId: number): Promise<{messages: any[], 
         }
 
         function extractFromDirectDOM() {
+          const items: Array<{ el: Element, role: 'user' | 'assistant' }> = []
+
           // 查找助手消息
           const assistantEls = document.querySelectorAll('.ds-assistant-message-main-content')
           debug.directAssistant = assistantEls.length
-          assistantEls.forEach(el => {
-            const content = extractAssistantMarkdown(el)
-            if (content) {
-              messages.push({ role: 'assistant', content: content })
-            }
-          })
+          assistantEls.forEach(el => items.push({ el, role: 'assistant' }))
 
           // 查找用户消息（通过排除助手消息的方式）
           const messageEls = document.querySelectorAll('.ds-message, [class*="message"]')
           debug.directUser = messageEls.length
           messageEls.forEach(el => {
-            const hasAssistant = el.querySelector('.ds-assistant-message-main-content')
-            if (hasAssistant) return
+            if (el.querySelector('.ds-assistant-message-main-content')) return
             const text = (el.textContent || '').trim()
             if (text.length > 0 && text.length < 5000) {
-              messages.push({ role: 'user', content: text })
+              items.push({ el, role: 'user' })
             }
           })
+
+          // 关键：按 DOM 中的真实先后顺序排序，避免回答跑到提问前面
+          items.sort((a, b) =>
+            (a.el.compareDocumentPosition(b.el) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1
+          )
+
+          for (const { el, role } of items) {
+            const text = (el.textContent || '').trim()
+            if (role === 'assistant') {
+              const content = extractAssistantMarkdown(el)
+              if (content) {
+                const msg: any = { role: 'assistant', content }
+                const search = extractSearchForElement(el)
+                if (search.summary) msg.searchSummary = search.summary
+                if (search.references.length > 0) msg.searchReferences = search.references
+                messages.push(msg)
+              }
+            } else if (text.length > 0 && text.length < 5000) {
+              messages.push({ role: 'user', content: text })
+            }
+          }
         }
 
         function extractAssistantMarkdown(el: Element): string | null {
